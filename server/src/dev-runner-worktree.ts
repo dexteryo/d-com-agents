@@ -50,7 +50,8 @@ export function isLinkedGitWorktreeCheckout(rootDir: string): boolean {
   const stat = lstatSync(gitMetadataPath);
   if (!stat.isFile()) return false;
 
-  return readFileSync(gitMetadataPath, "utf8").trimStart().startsWith("gitdir:");
+  const gitdirPointer = readFileSync(gitMetadataPath, "utf8").trim();
+  return /^gitdir:.*[\\/]worktrees[\\/]/.test(gitdirPointer);
 }
 
 export function resolveWorktreeEnvFilePath(rootDir: string): string {

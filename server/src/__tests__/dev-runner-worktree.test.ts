@@ -86,6 +86,13 @@ describe("dev-runner worktree env bootstrap", () => {
     expect(isLinkedGitWorktreeCheckout(root)).toBe(true);
   });
 
+  it("does not treat a submodule checkout as a linked git worktree", () => {
+    const root = createTempRoot("paperclip-dev-runner-submodule-");
+    fs.writeFileSync(path.join(root, ".git"), "gitdir: ../../.git/modules/workspace/paperclip\n", "utf8");
+
+    expect(isLinkedGitWorktreeCheckout(root)).toBe(false);
+  });
+
   it("loads repo-local Paperclip env for initialized worktrees without overriding explicit env", () => {
     const root = createTempRoot("paperclip-dev-runner-worktree-env-");
     fs.mkdirSync(path.join(root, ".paperclip"), { recursive: true });
