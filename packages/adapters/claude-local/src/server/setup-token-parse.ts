@@ -308,6 +308,14 @@ function hasValidQuery(parsed: URL): boolean {
   return true;
 }
 
+const OPAQUE_REQUEST_QUERY_RE = /^[A-Za-z0-9_-]{32,128}$/;
+
+function hasOpaqueRequestQuery(parsed: URL): boolean {
+  const rawQuery = parsed.search.slice(1);
+  if (API_KEY_RE.test(rawQuery)) return false;
+  return OPAQUE_REQUEST_QUERY_RE.test(rawQuery);
+}
+
 /**
  * Returns `candidate` when it is a valid authorization URL, or null. The final
  * validator applies to every candidate, from an OSC 8 URI or from a plain-text
@@ -331,7 +339,7 @@ function validateAuthUrl(candidate: string): string | null {
   if (parsed.port !== "" || parsed.hash !== "") return null;
   const pair = `${parsed.origin}${parsed.pathname}`;
   if (!SETUP_TOKEN_AUTH_URLS.includes(pair as (typeof SETUP_TOKEN_AUTH_URLS)[number])) return null;
-  if (!hasValidQuery(parsed)) return null;
+  if (!hasValidQuery(parsed) && !hasOpaqueRequestQuery(parsed)) return null;
   return candidate;
 }
 

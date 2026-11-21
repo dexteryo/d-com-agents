@@ -108,6 +108,49 @@ struct NamedExecutablePath {
     basename: std::ffi::OsString,
     device: u64,
     inode: u64,
+    _private_directory: Option<PrivateImageDirectory>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct PrivateImageDirectory {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl PrivateImageDirectory {
+    fn create(display_path: &Path) -> Result<Self, LocalRunnerError> {
+        create_private_runtime_directory(display_path).map(|path| Self { path })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn create_private_runtime_directory(display_path: &Path) -> Result<PathBuf, LocalRunnerError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = fs::canonicalize(std::env::temp_dir())
+        .map_err(|error| snapshot_error(display_path, error))?;
+    let path = root.join(format!(
+        ".paperclip-verified-runtime-{}",
+        Uuid::new_v4().simple()
+    ));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .map_err(|error| snapshot_error(display_path, error))?;
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn directory_accepts_new_entries(directory: &Path) -> bool {
+    use rustix::fs::{access, Access};
+    access(directory, Access::WRITE_OK | Access::EXEC_OK).is_ok()
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for PrivateImageDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -192,19 +235,12 @@ impl NamedExecutableSnapshot {
         source: &mut File,
         expected_sha256: &str,
     ) -> Result<Self, LocalRunnerError> {
-        use rustix::fs::{open, openat, Mode, OFlags};
-        let parent_path = display_path
+        use rustix::fs::{openat, Mode, OFlags};
+        let source_parent_path = display_path
             .parent()
             .ok_or_else(|| snapshot_error(display_path, "executable has no parent"))?;
-        let parent = File::from(
-            open(
-                parent_path,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|error| snapshot_error(display_path, error))?,
-        );
-        let parent_metadata = parent
+        let source_parent = open_directory(source_parent_path, display_path)?;
+        let parent_metadata = source_parent
             .metadata()
             .map_err(|error| snapshot_error(display_path, error))?;
         if parent_metadata.permissions().mode() & 0o022 != 0 {
@@ -217,16 +253,31 @@ impl NamedExecutableSnapshot {
             ".paperclip-verified-executable-{}",
             Uuid::new_v4().simple()
         ));
+        let create_flags =
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let create_mode = Mode::RUSR | Mode::WUSR | Mode::XUSR;
+        let (parent, parent_path, private_directory, writable) =
+            match openat(&source_parent, &basename, create_flags, create_mode) {
+                Ok(fd) => (
+                    source_parent,
+                    source_parent_path.to_owned(),
+                    None,
+                    File::from(fd),
+                ),
+                Err(
+                    rustix::io::Errno::ACCESS | rustix::io::Errno::ROFS | rustix::io::Errno::PERM,
+                ) => {
+                    let private_directory = PrivateImageDirectory::create(display_path)?;
+                    let parent = open_directory(&private_directory.path, display_path)?;
+                    let fd = openat(&parent, &basename, create_flags, create_mode)
+                        .map_err(|error| snapshot_error(display_path, error))?;
+                    let path = private_directory.path.clone();
+                    (parent, path, Some(private_directory), File::from(fd))
+                }
+                Err(error) => return Err(snapshot_error(display_path, error)),
+            };
         let path = parent_path.join(&basename);
-        let mut writable = File::from(
-            openat(
-                &parent,
-                &basename,
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR | Mode::XUSR,
-            )
-            .map_err(|error| snapshot_error(display_path, error))?,
-        );
+        let mut writable = writable;
         // If fstat itself fails, ownership cannot be proven. Fail closed and
         // leave the randomized entry rather than unlink a possibly substituted
         // name without its inode identity.
@@ -239,6 +290,7 @@ impl NamedExecutableSnapshot {
             basename,
             device: metadata.dev(),
             inode: metadata.ino(),
+            _private_directory: private_directory,
         };
         copy_verified(source, &mut writable, display_path, expected_sha256)?;
         writable
@@ -343,6 +395,18 @@ fn sealed_snapshot(
         .seek(SeekFrom::Start(0))
         .map_err(|error| snapshot_error(display_path, error))?;
     Ok(snapshot)
+}
+
+#[cfg(target_os = "macos")]
+fn open_directory(path: &Path, display_path: &Path) -> Result<File, LocalRunnerError> {
+    use rustix::fs::{open, Mode, OFlags};
+    open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| snapshot_error(display_path, error))
 }
 
 #[cfg(target_os = "macos")]
@@ -671,11 +735,20 @@ fn materialize_executable(
     artifact: &VerifiedProcessArtifact,
 ) -> Result<TemporaryExecutable, LocalRunnerError> {
     let directory = verified_executable_parent(artifact)?;
-    let path = directory.join(format!(
-        ".paperclip-verified-executable-{}",
-        Uuid::new_v4().simple()
-    ));
-    materialize_executable_at(artifact, path, None)
+    let name = format!(".paperclip-verified-executable-{}", Uuid::new_v4().simple());
+    if directory_accepts_new_entries(directory) {
+        return materialize_executable_at(artifact, directory.join(name), None);
+    }
+    let private_directory = create_private_runtime_directory(&artifact.display_path)?;
+    let result = materialize_executable_at(
+        artifact,
+        private_directory.join(name),
+        Some(private_directory.clone()),
+    );
+    if result.is_err() {
+        let _ = fs::remove_dir(private_directory);
+    }
+    result
 }
 
 #[cfg(target_os = "macos")]
@@ -683,15 +756,21 @@ fn materialize_bound_executable(
     artifact: &VerifiedProcessArtifact,
 ) -> Result<TemporaryExecutable, LocalRunnerError> {
     let parent = verified_executable_parent(artifact)?;
-    let directory = parent.join(format!(
-        ".paperclip-verified-executable-{}",
-        Uuid::new_v4().simple()
-    ));
-    fs::create_dir(&directory).map_err(|error| snapshot_error(&artifact.display_path, error))?;
-    if let Err(error) = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)) {
-        let _ = fs::remove_dir(&directory);
-        return Err(snapshot_error(&artifact.display_path, error));
-    }
+    let directory = if directory_accepts_new_entries(parent) {
+        let directory = parent.join(format!(
+            ".paperclip-verified-executable-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&directory)
+            .map_err(|error| snapshot_error(&artifact.display_path, error))?;
+        if let Err(error) = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)) {
+            let _ = fs::remove_dir(&directory);
+            return Err(snapshot_error(&artifact.display_path, error));
+        }
+        directory
+    } else {
+        create_private_runtime_directory(&artifact.display_path)?
+    };
     let result =
         materialize_executable_at(artifact, directory.join("launch"), Some(directory.clone()));
     if result.is_err() {
@@ -1541,6 +1620,66 @@ mod tests {
             assert!(executable.validate_before_spawn().is_err());
             fs::set_permissions(&executable.image.path, fs::Permissions::from_mode(0o500)).unwrap();
             executable.validate_before_spawn().unwrap();
+        }
+
+        #[test]
+        fn read_only_runtime_directory_gets_a_private_image_that_is_removed_on_drop() {
+            let fixture = Fixture::new();
+            let runtime = fixture.directory.join("store-bin");
+            fs::create_dir(&runtime).unwrap();
+            let source = runtime.join("node");
+            fs::write(&source, b"authenticated executable bytes").unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o500)).unwrap();
+            let artifact = VerifiedProcessArtifact::snapshot_verified_executable(
+                source.clone(),
+                File::open(&source).unwrap(),
+                &format!(
+                    "sha256:{:x}",
+                    Sha256::digest(b"authenticated executable bytes")
+                ),
+            );
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+            let artifact = artifact.expect("a read-only runtime directory must not block admission");
+            let executable = artifact.executable.as_ref().unwrap();
+            let image = executable.image.path.clone();
+            let private_directory = image.parent().unwrap().to_owned();
+            assert_ne!(private_directory, runtime);
+            assert_eq!(
+                fs::metadata(&private_directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            executable.validate_before_spawn().unwrap();
+            assert_eq!(fs::read(&image).unwrap(), b"authenticated executable bytes");
+            drop(artifact);
+            assert!(!image.exists());
+            assert!(!private_directory.exists());
+        }
+
+        #[test]
+        fn read_only_runtime_directory_materializes_launch_images_privately() {
+            let fixture = Fixture::new();
+            let runtime = fixture.directory.join("store-bin");
+            fs::create_dir(&runtime).unwrap();
+            let source = runtime.join("node");
+            let bytes = b"authenticated executable bytes";
+            let artifact = verified_artifact(&source, bytes);
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o500)).unwrap();
+            let plain = materialize_executable(&artifact);
+            let bound = materialize_bound_executable(&artifact);
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+            let plain = plain.expect("plain image must fall back to a private directory");
+            let bound = bound.expect("bound image must fall back to a private directory");
+            for image in [&plain, &bound] {
+                assert_ne!(image.path.parent().unwrap(), runtime);
+                assert_eq!(fs::read(&image.path).unwrap(), bytes);
+            }
+            let directories = [
+                plain.cleanup_directory.clone().unwrap(),
+                bound.cleanup_directory.clone().unwrap(),
+            ];
+            drop(plain);
+            drop(bound);
+            assert!(directories.iter().all(|directory| !directory.exists()));
         }
 
         #[test]

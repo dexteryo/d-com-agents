@@ -182,12 +182,35 @@ fn verified_launch_preserves_homebrew_node_loader_layout() {
         .receive_stdout_line(Duration::from_secs(2))
         .unwrap()
         .expect("Node should report its executable path");
-    assert_eq!(
-        Path::new(&executed_node).parent(),
-        node.parent(),
-        "verified Node must execute beside the authenticated runtime"
-    );
+    assert_runs_beside_or_in_private_directory(&executed_node, &node);
     process.wait().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn assert_runs_beside_or_in_private_directory(executed: &str, source: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let executed_parent = Path::new(executed).parent().unwrap();
+    let source_parent = source.parent().unwrap();
+    if executed_parent == source_parent {
+        return;
+    }
+    assert!(
+        rustix::fs::access(
+            source_parent,
+            rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK
+        )
+        .is_err(),
+        "only an unwritable runtime directory may relocate the verified image"
+    );
+    assert!(executed_parent
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with(".paperclip-verified-runtime-"));
+    assert_eq!(
+        fs::metadata(executed_parent).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -348,7 +371,7 @@ mod darwin_executable_role {
             .receive_stdout_line(Duration::from_secs(2))
             .unwrap()
             .expect("Node must report executable path");
-        assert_eq!(Path::new(&executed_node).parent(), node.parent());
+        assert_runs_beside_or_in_private_directory(&executed_node, &node);
         assert!(Path::new(&executed_node)
             .file_name()
             .unwrap()

@@ -27,6 +27,7 @@ const CODE = "ac_0aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT";
 const CODE_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 const STATE = "Xy7Kd2Pq9Rn4Vb8Lf1Mw6Zc3Hj0Tg5Us";
 const SCOPE = "org:create_api_key user:profile";
+const OPAQUE_REQUEST_TOKEN = "Ip7o6AghtrfuOqRffXdrzHsU4bXPm8FrdlzySJLe1sT0";
 
 // The query of a well-formed authorization URL. The `redirect_uri` and the
 // `scope` are percent-encoded the way the CLI emits them; the parser decodes and
@@ -107,6 +108,37 @@ describe("parseSetupTokenPrompt", () => {
     expect(result).not.toBeNull();
     expect(result?.url).toBe(CLAUDE_AI_URL);
     expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
+  });
+
+  it("returns the claude.ai URL when the 2.1.330 CLI emits one opaque request token", () => {
+    const opaqueUrl = `https://claude.ai/oauth/authorize?${OPAQUE_REQUEST_TOKEN}`;
+    const display = `\x1b[38;2;153;153;153m${opaqueUrl}\x1b[39m`;
+    const hyperlink = `\x1b]8;id=89dbl0;${opaqueUrl}\x07${display}\x1b]8;;\x07`;
+    const result = parseSetupTokenPrompt(completeOutput(hyperlink));
+    expect(result?.url).toBe(opaqueUrl);
+    expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
+  });
+
+  it("returns null for an opaque request token that is too short", () => {
+    const shortToken = `https://claude.ai/oauth/authorize?${OPAQUE_REQUEST_TOKEN.slice(0, 16)}`;
+    expect(parseSetupTokenPrompt(completeOutput(shortToken))).toBeNull();
+  });
+
+  it("returns null for an opaque request token with a value or extra key", () => {
+    const withValue = `https://claude.ai/oauth/authorize?${OPAQUE_REQUEST_TOKEN}=1`;
+    const withExtraKey = `https://claude.ai/oauth/authorize?${OPAQUE_REQUEST_TOKEN}&a=1`;
+    expect(parseSetupTokenPrompt(completeOutput(withValue))).toBeNull();
+    expect(parseSetupTokenPrompt(completeOutput(withExtraKey))).toBeNull();
+  });
+
+  it("returns null for an opaque request token shaped like an API key", () => {
+    const keyShaped = "https://claude.ai/oauth/authorize?sk-ant-oat01-Ip7o6AghtrfuOqRffXdrzHsU4bXPm8";
+    expect(parseSetupTokenPrompt(completeOutput(keyShaped))).toBeNull();
+  });
+
+  it("returns null for an opaque request token on a look-alike host", () => {
+    const wrongHost = `https://claude.ai.evil.example/oauth/authorize?${OPAQUE_REQUEST_TOKEN}`;
+    expect(parseSetupTokenPrompt(completeOutput(wrongHost))).toBeNull();
   });
 
   it("reassembles the claude.ai URL from the 2.1.19 hard-wrapped plain-text form", () => {
